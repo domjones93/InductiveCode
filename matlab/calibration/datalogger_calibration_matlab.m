@@ -1,5 +1,5 @@
 % Collect calibration data for multiple LDC1614 sensors, each on its own COM port.
-% The output CSV contains one target position row with L0-L3 columns for every sensor.
+% Each sensor gets its own CSV file, while all sensors are sampled at each target.
 close all
 clear
 clc
@@ -8,7 +8,8 @@ scriptDir = fileparts(mfilename('fullpath'));
 addpath(fileparts(scriptDir));
 
 % ---------------- User configuration ----------------
-filename = fullfile(scriptDir, 'calibration_data_all_sensors.csv');
+recordingType = 'calibration'; % 'calibration' or 'validation'
+outputDir = fullfile(fileparts(scriptDir), 'v2_sensor');
 
 sensorSpecs = struct( ...
     'id', {'S1', 'S2', 'S3', 'S4', 'S5', 'S6'}, ...
@@ -36,12 +37,8 @@ nTests = 300;
 moveSettleSeconds = 0.3;
 % ----------------------------------------------------
 
-if exist(filename, 'file')
-    overwrite = input([filename, ' already exists. Overwrite? (y/n): '], 's');
-    if ~strcmpi(overwrite, 'y')
-        disp('Exiting without overwriting.');
-        return;
-    end
+if ~isfolder(outputDir)
+    mkdir(outputDir);
 end
 
 locations = rand(nTests, 6) .* [2*xlim, 2*ylim, 2*zlim, 0, 0, 0] - [xlim, ylim, zlim, 0, 0, 0];
@@ -49,8 +46,9 @@ locations(:, 4:6) = [rollValue, pitchValue, yawValue];
 locations = optimize_path(locations);
 
 sensors = cell(1, numel(sensorSpecs));
+fileIds = -ones(1, numel(sensorSpecs));
+filenames = cell(1, numel(sensorSpecs));
 solano = [];
-fid = -1;
 
 try
     solano = tcpclient(hexapodHost, hexapodPort, "Timeout", 1);
@@ -65,11 +63,16 @@ try
         sensors{idx}.connect();
     end
 
-    fid = fopen(filename, 'w');
-    if fid == -1
-        error('Unable to create calibration file: %s', filename);
+    timestampLabel = datestr(now, 'yyyymmdd-HHMMSS');
+    for sensorIdx = 1:numel(sensorSpecs)
+        sensorId = lower(sensorSpecs(sensorIdx).id);
+        filenames{sensorIdx} = fullfile(outputDir, sprintf('%s_%s_%s.csv', recordingType, sensorId, timestampLabel));
+        fileIds(sensorIdx) = fopen(filenames{sensorIdx}, 'w');
+        if fileIds(sensorIdx) == -1
+            error('Unable to create calibration file: %s', filenames{sensorIdx});
+        end
+        fprintf(fileIds(sensorIdx), 'timestamp,Tx,Ty,Tz,Roll,Pitch,Yaw,L0,L1,L2,L3\n');
     end
-    fprintf(fid, '%s\n', strjoin(build_calibration_header(sensorSpecs), ','));
 
     writeline(solano, "ControlOn");
     writeline(solano, "move_P2P 0 0 0 " + num2str(rollValue) + " " + num2str(pitchValue) + " " + num2str(yawValue));
@@ -90,30 +93,35 @@ try
         pause(moveSettleSeconds);
 
         for repeatIdx = 1:sampleRepeatsPerLocation
-            rowValues = nan(1, numel(sensorSpecs) * 4);
             for sensorIdx = 1:numel(sensors)
                 try
                     [~, sensorPackets] = sensors{sensorIdx}.process_single_measurement_all();
-                    rowValues(sensor_column_range(sensorIdx)) = sensorPackets(1).inductance;
+                    inductanceValues = sensorPackets(1).inductance;
                 catch ME
+                    inductanceValues = nan(1, 4);
                     warning('Failed reading %s on %s: %s', sensorSpecs(sensorIdx).id, sensorSpecs(sensorIdx).port, ME.message);
                 end
-            end
 
-            fprintf(fid, ['%.10f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,', repmat('%.9f,', 1, numel(rowValues) - 1), '%.9f\n'], ...
-                now, x, y, z, roll, pitch, yaw, rowValues);
+                fprintf(fileIds(sensorIdx), '%.10f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.9f,%.9f,%.9f,%.9f\n', ...
+                    now, x, y, z, roll, pitch, yaw, inductanceValues);
+            end
             pause(samplePauseSeconds);
         end
     end
 
     writeline(solano, "ControlOff");
-    fprintf('Calibration data saved to: %s\n', filename);
+    fprintf('Calibration data saved to:\n');
+    for sensorIdx = 1:numel(filenames)
+        fprintf('  %s\n', filenames{sensorIdx});
+    end
 catch ME
     warning('Calibration stopped: %s', ME.message);
 end
 
-if fid ~= -1
-    fclose(fid);
+for sensorIdx = 1:numel(fileIds)
+    if fileIds(sensorIdx) ~= -1
+        fclose(fileIds(sensorIdx));
+    end
 end
 for idx = 1:numel(sensors)
     if ~isempty(sensors{idx})
@@ -142,18 +150,4 @@ function optimizedPath = optimize_path(locations)
         optimizedPath = [optimizedPath; locations(idx, :)]; %#ok<AGROW>
         locations(idx, :) = [];
     end
-end
-
-function header = build_calibration_header(sensorSpecs)
-    header = {'timestamp', 'Tx', 'Ty', 'Tz', 'Roll', 'Pitch', 'Yaw'};
-    for sensorIdx = 1:numel(sensorSpecs)
-        for channelIdx = 0:3
-            header{end + 1} = sprintf('%s_L%d', sensorSpecs(sensorIdx).id, channelIdx); %#ok<AGROW>
-        end
-    end
-end
-
-function cols = sensor_column_range(sensorIdx)
-    firstCol = (sensorIdx - 1) * 4 + 1;
-    cols = firstCol:(firstCol + 3);
 end

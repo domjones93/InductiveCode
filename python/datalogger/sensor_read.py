@@ -84,8 +84,8 @@ class Sensor:
 
     @staticmethod
     def build_config_command(sensor_config):
-        if not 1 <= len(sensor_config) <= 2:
-            raise ValueError("Pico firmware supports 1 or 2 configured sensors.")
+        if not 1 <= len(sensor_config) <= 3:
+            raise ValueError("Pico firmware supports 1 to 3 configured sensors.")
 
         payload = f"{len(sensor_config):02X}"
         for bus_index, address in sensor_config:

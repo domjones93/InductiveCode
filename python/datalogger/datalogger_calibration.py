@@ -46,7 +46,7 @@ def write_calibration_row(filename, location, sensor_values):
         f.write(",".join(str(value) for value in values) + "\n")
 
 if __name__ == "__main__":
-    sensor_id = "s5"
+    sensor_id = "s6"
     type = "calibration" # or "validation" # or 
     filename = "./v2_sensor/" + type + "_"+sensor_id+"_"+time.strftime("%Y%m%d-%H%M%S")+".csv"
     

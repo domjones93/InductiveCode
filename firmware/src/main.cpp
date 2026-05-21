@@ -7,7 +7,7 @@ static const uint32_t SERIAL_BAUD = 115200;
 static const uint32_t I2C_CLOCK_HZ = 400000;
 static const uint8_t LDC1614_ADDRESS = 0x2A;
 static const uint8_t BUS_COUNT = 2;
-static const uint8_t MAX_SENSOR_COUNT = 2;
+static const uint8_t MAX_SENSOR_COUNT = 3;
 static const uint16_t SAMPLE_DELAY_MS = 66;
 
 static const float OSC_FREQ_MHZ = 40.0;
@@ -33,8 +33,9 @@ static BusSlot bus_slots[BUS_COUNT] = {
 static ActiveSensorConfig active_sensors[MAX_SENSOR_COUNT] = {
     {0, LDC1614_ADDRESS},
     {1, LDC1614_ADDRESS},
+    {1, 0x2B},
 };
-static uint8_t active_sensor_count = 2;
+static uint8_t active_sensor_count = 3;
 
 static SensorPacketData packet_data[MAX_SENSOR_COUNT];
 static char packet_hex[packetHexLength(MAX_SENSOR_COUNT) + 1];
@@ -173,6 +174,8 @@ static void handleConfigCommand() {
         active_sensors[i] = requested[i];
     }
 
+    initSensors();
+
     Serial.print("CONFIG OK ");
     Serial.print(active_sensor_count);
     for (uint8_t i = 0; i < active_sensor_count; i++) {
@@ -186,7 +189,6 @@ static void handleConfigCommand() {
     }
     Serial.println();
     Serial.flush();
-    initSensors();
 }
 
 static void readAndWritePacket() {

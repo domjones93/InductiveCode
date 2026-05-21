@@ -103,6 +103,7 @@ classdef Sensor < handle
             if ~startsWith(response, 'CONFIG OK')
                 error('MCU rejected sensor config %s: %s', strtrim(command), response);
             end
+            fprintf('%s\n', response);
             pause(0.15);
             flush(obj.ser);
         end
@@ -112,6 +113,7 @@ classdef Sensor < handle
                 error('Serial connection is not established. Call connect() first.');
             end
 
+            flush(obj.ser);
             write(obj.ser, uint8('s'), 'uint8');
             expected = obj.packet_hex_length();
             deadline = tic;
@@ -263,8 +265,8 @@ classdef Sensor < handle
             if size(obj.sensorConfig, 2) ~= 2
                 error('sensorConfig must be an Nx2 matrix: [bus_index, i2c_address].');
             end
-            if obj.sensor_count() < 1 || obj.sensor_count() > 2
-                error('Pico firmware supports 1 or 2 configured sensors.');
+            if obj.sensor_count() < 1 || obj.sensor_count() > 3
+                error('Pico firmware supports 1 to 3 configured sensors.');
             end
             if any(obj.sensorConfig(:, 1) < 0 | obj.sensorConfig(:, 1) > 1)
                 error('I2C bus index must be 0 or 1.');
