@@ -90,7 +90,6 @@ static void beginBuses() {
 }
 
 static void initSensors() {
-    beginBuses();
     for (uint8_t i = 0; i < active_sensor_count; i++) {
         const ActiveSensorConfig &config = active_sensors[i];
         LDC1614 &sensor = bus_slots[config.bus_index].sensor;
