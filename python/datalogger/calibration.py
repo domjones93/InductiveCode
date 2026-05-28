@@ -24,14 +24,7 @@ LOSS_PLOT   = True   # set False to skip matplotlib loss curves
 # ── Architectures to benchmark ─────────────────────────────────────────────────
 # (name, hidden_layers, activation)
 ARCHITECTURES = [
-    ("Small-ReLU",      [64, 64],             "relu"),
-    ("Medium-ReLU",     [128, 128, 64],        "relu"),
     ("Large-ReLU",      [256, 128, 64, 32],    "relu"),
-    ("Medium-Tanh",     [128, 128, 64],        "tanh"),
-    ("Medium-ELU",      [128, 128, 64],        "elu"),
-    ("Wide-ReLU",       [512, 256],            "relu"),
-    ("Deep-ReLU",       [64, 64, 64, 64, 64],  "relu"),
-    ("Medium-Dropout",  [128, 128, 64],        "relu"),  # adds dropout
 ]
 
 
