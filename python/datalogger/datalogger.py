@@ -7,28 +7,38 @@ import queue
 import numpy as np
 from sensor_read import Sensor
 
+import os
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
 # ── Configuration ──────────────────────────────────────────────────────────────
+# MODEL_DIR: folder containing all .pth and _scalers.pkl files.
+#            Model files are expected as <MODEL_DIR>/<label_lower>.pth
+#            Scaler files are expected as <MODEL_DIR>/<label_lower>_scalers.pkl
+MODEL_DIR = os.path.join(_HERE, "../v2_sensor/models")
+
 # SENSOR_SETUP: list of dicts, one per physical sensor slot.
-#   "bus"    : I2C bus index (0 or 1)
-#   "addr"   : I2C address (e.g. 0x2A)
-#   "label"  : human-readable sensor ID (e.g. "S3") — used in plot titles & CSV
-#   "calib"  : path to the .pth calibration model for this sensor
+#   "bus"   : I2C bus index (0 or 1)
+#   "addr"  : I2C address (e.g. 0x2A)
+#   "label" : human-readable sensor ID (e.g. "S2") — also used to find model files
 SENSOR_SETUP = [
-    {"bus": 0, "addr": 0x2A, "label": "S6", "calib": "../v2_sensor/models/s6.pth"},
+    {"bus": 0, "addr": 0x2A, "label": "s2"},
+    {"bus": 1, "addr": 0x2A, "label": "s3"},
+    {"bus": 1, "addr": 0x2B, "label": "s4"},
 ]
 
-PORT              = "COM5"
+PORT              = "COM3"
 FREQ_WINDOW       = 20
 PLOT_INTERVAL_S   = 1 / 30
-TEST_TIME_S       = 60.0
+TEST_TIME_S       = 5.0
 MAX_PLOT_POINTS   = 2000
 PLOT_DECIMATION_S = 0.05
 POS_LABELS        = ["dX", "dY", "dZ"]
 N_POS             = 3
 N_CHANNELS        = 4
+TARE_SAMPLES      = 10   # number of samples averaged for tare
 
 
-def run_datalogger(port=PORT, sensor_setup=SENSOR_SETUP,
+def run_datalogger(port=PORT, sensor_setup=SENSOR_SETUP, model_dir=MODEL_DIR,
                    test_time=TEST_TIME_S, plot=True, save=True):
 
     sensor_config = [(s["bus"], s["addr"]) for s in sensor_setup]
@@ -39,32 +49,65 @@ def run_datalogger(port=PORT, sensor_setup=SENSOR_SETUP,
     sensor.connect()
     if not sensor.ser:
         print("Failed to connect to sensor.")
-        return
-
-    # Load per-sensor calibration models
+        return    # Load per-sensor calibration models
     import torch
+    import traceback
+    import pickle
+    import os
     from sensor_read import FeedForwardNN
     calib_models = []
+    calib_scalers = []   # list of {"scaler_X": ..., "scaler_y": ...} or None
     for s in sensor_setup:
-        model = FeedForwardNN(input_size=N_CHANNELS, output_size=N_POS)
+        abs_path    = os.path.abspath(os.path.join(model_dir, f"{s['label'].lower()}.pth"))
+        scaler_path = os.path.abspath(os.path.join(model_dir, f"{s['label'].lower()}_scalers.pkl"))
+        print(f"[CALIB] Loading {s['label']} from: {abs_path}  (exists={os.path.exists(abs_path)})")
         try:
-            model.load_state_dict(torch.load(s["calib"], map_location="cpu"))
+            state_dict = torch.load(abs_path, map_location="cpu")
+            # Infer hidden layer sizes from checkpoint weights (exclude output layer)
+            weight_keys = [k for k in state_dict.keys() if k.endswith(".weight")]
+            hidden_sizes = [state_dict[k].shape[0] for k in weight_keys[:-1]]
+            model = FeedForwardNN(input_size=N_CHANNELS, output_size=N_POS, hidden_sizes=hidden_sizes)
+            model.load_state_dict(state_dict)
             model.eval()
-            print(f"Loaded calibration for {s['label']} from {s['calib']}")
+            print(f"[CALIB] Loaded OK: {s['label']}")
         except Exception as e:
             print(f"WARNING: could not load calibration for {s['label']}: {e}")
+            traceback.print_exc()
             model = None
         calib_models.append(model)
 
+        # Load scalers
+        if os.path.exists(scaler_path):
+            with open(scaler_path, "rb") as f:
+                scalers = pickle.load(f)
+            print(f"[CALIB] Scalers loaded for {s['label']}")
+        else:
+            print(f"WARNING: no scalers found at {scaler_path} — predictions will be unscaled!")
+            scalers = None
+        calib_scalers.append(scalers)
+
     def predict(s_idx, inductance):
-        model = calib_models[s_idx]
+        model   = calib_models[s_idx]
+        scalers = calib_scalers[s_idx]
+        label   = sensor_setup[s_idx]["label"]
         if model is None:
             return np.zeros(N_POS)
-        t = torch.tensor(inductance, dtype=torch.float32).unsqueeze(0)
+        if np.all(inductance == 0):
+            print(f"[PREDICT] {label}: WARNING all inductance values are zero!")
+        # Scale input
+        if scalers is not None:
+            x = scalers["scaler_X"].transform(inductance.reshape(1, -1)).astype(np.float32)
+        else:
+            x = inductance.reshape(1, -1).astype(np.float32)
+        t = torch.tensor(x, dtype=torch.float32)
         with torch.no_grad():
-            return model(t).numpy()[0]
-
-    # pos_buffer[sensor_idx][axis_idx] = list of floats
+            y_scaled = model(t).numpy()
+        # Inverse-scale output
+        if scalers is not None:
+            result = scalers["scaler_y"].inverse_transform(y_scaled)[0]
+        else:
+            result = y_scaled[0]
+        return result# pos_buffer[sensor_idx][axis_idx] = list of floats
     pos_buffer  = [[[] for _ in range(N_POS)] for _ in range(n_sensors)]
     time_buffer = [[] for _ in range(n_sensors)]
     lock         = threading.Lock()
@@ -76,6 +119,22 @@ def run_datalogger(port=PORT, sensor_setup=SENSOR_SETUP,
     elapsed_ref  = [0.0]
     last_store   = [0.0]
 
+    # ── Tare ───────────────────────────────────────────────────────────────────
+    print(f"Taring sensors ({TARE_SAMPLES} samples)...")
+    tare_accum = [np.zeros(N_POS) for _ in range(n_sensors)]
+    tare_count = 0
+    while tare_count < TARE_SAMPLES:
+        try:
+            _, sensors_raw = sensor.process_single_measurement_all()
+            for s_idx in range(n_sensors):
+                ch_data = np.array(sensors_raw[s_idx]["inductance"], dtype=float)
+                tare_accum[s_idx] += predict(s_idx, ch_data)
+            tare_count += 1
+        except Exception as e:
+            print(f"Tare sample error: {e}")
+    tare_offset = [tare_accum[i] / TARE_SAMPLES for i in range(n_sensors)]
+    print(f"Tare complete. Offsets: { {sensor_setup[i]['label']: np.round(tare_offset[i], 4).tolist() for i in range(n_sensors)} }")
+
     # ── Acquisition thread ─────────────────────────────────────────────────────
     def acquisition_loop():
         while not stop_event.is_set():
@@ -84,7 +143,7 @@ def run_datalogger(port=PORT, sensor_setup=SENSOR_SETUP,
                 positions = []
                 for s_idx in range(n_sensors):
                     ch_data = np.array(sensors_raw[s_idx]["inductance"], dtype=float)
-                    positions.append(predict(s_idx, ch_data))
+                    positions.append(predict(s_idx, ch_data) - tare_offset[s_idx])
 
                 with lock:
                     if time_ref[0] is None:
@@ -106,11 +165,12 @@ def run_datalogger(port=PORT, sensor_setup=SENSOR_SETUP,
 
                 if save and store:
                     wall_t = time.time()
+                    # Build one row: wall_time, elapsed_s, then for each sensor: L0..L3, dX, dY, dZ
+                    parts = [f"{wall_t:.6f}", f"{elapsed_s:.6f}"]
                     for s_idx, pos in enumerate(positions):
-                        label   = sensor_setup[s_idx]["label"]
-                        raw_str = ",".join(f"{v:.6f}" for v in sensors_raw[s_idx]["inductance"])
-                        pos_str = ",".join(f"{v:.6f}" for v in pos)
-                        save_q.put(f"{wall_t:.6f},{elapsed_s:.6f},{label},{raw_str},{pos_str}")
+                        parts += [f"{v:.6f}" for v in sensors_raw[s_idx]["inductance"]]
+                        parts += [f"{v:.6f}" for v in pos]
+                    save_q.put(",".join(parts))
 
             except Exception as e:
                 print(f"Acquisition error: {e}")
@@ -119,9 +179,15 @@ def run_datalogger(port=PORT, sensor_setup=SENSOR_SETUP,
     def save_worker():
         filename = f"datalogger_{time.strftime('%Y%m%d_%H%M%S')}.csv"
         print(f"Saving to {filename}")
-        raw_cols = ",".join(f"L{c}" for c in range(N_CHANNELS))
+        # Build header: wall_time, elapsed_s, then per-sensor columns
+        sensor_cols = []
+        for s in sensor_setup:
+            lbl = s["label"]
+            sensor_cols += [f"{lbl}_L{c}" for c in range(N_CHANNELS)]
+            sensor_cols += [f"{lbl}_{p}" for p in POS_LABELS]
+        header = "wall_time,elapsed_s," + ",".join(sensor_cols)
         with open(filename, "w", newline="") as f:
-            f.write(f"wall_time,elapsed_s,sensor_label,{raw_cols},{','.join(POS_LABELS)}\n")
+            f.write(header + "\n")
             while not stop_event.is_set() or not save_q.empty():
                 try:
                     f.write(save_q.get(timeout=0.1) + "\n")

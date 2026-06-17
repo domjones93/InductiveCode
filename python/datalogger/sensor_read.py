@@ -7,19 +7,21 @@ from torch import nn
 
 
 class FeedForwardNN(nn.Module):
-    def __init__(self, input_size, output_size):
-        super(FeedForwardNN, self).__init__()
-        self.fc1 = nn.Linear(input_size, 64)
-        self.fc2 = nn.Linear(64, 64)
-        self.fc3 = nn.Linear(64, 64)
-        self.fc4 = nn.Linear(64, output_size)
-        self.relu = nn.ReLU()
+    def __init__(self, input_size, output_size, hidden_sizes=None):
+        super().__init__()
+        if hidden_sizes is None:
+            hidden_sizes = [64, 64, 64, 64]
+        layers = []
+        in_dim = input_size
+        for h in hidden_sizes:
+            layers.append(nn.Linear(in_dim, h))
+            layers.append(nn.ReLU())
+            in_dim = h
+        layers.append(nn.Linear(in_dim, output_size))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x):
-        x = self.relu(self.fc1(x))
-        x = self.relu(self.fc2(x))
-        x = self.relu(self.fc3(x))
-        return self.fc4(x)
+        return self.net(x)
 
 
 INDUCTANCE_CONST = 25330.3387
@@ -246,7 +248,7 @@ class Sensor:
 
 
 if __name__ == "__main__":
-    port = "COM5"
+    port = "COM3"
     sensor = Sensor(port)
     sensor.connect()
     try:
