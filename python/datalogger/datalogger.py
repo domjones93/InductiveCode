@@ -180,39 +180,78 @@ def run_datalogger(port=PORT, sensor_setup=SENSOR_SETUP, model_dir=MODEL_DIR,
             result = scalers["scaler_y"].inverse_transform(y_scaled)[0]
         else:
             result = y_scaled[0]
-        return result# pos_buffer[sensor_idx][axis_idx] = list of floats
+        return result
+
+    def compute_tare():
+        tare_accum = [np.zeros(N_POS) for _ in range(n_sensors)]
+        tare_count = 0
+        while tare_count < TARE_SAMPLES and not stop_event.is_set():
+            try:
+                with serial_lock:
+                    _, sensors_raw = sensor.process_single_measurement_all()
+                for s_idx in range(n_sensors):
+                    ch_data = np.array(sensors_raw[s_idx]["inductance"], dtype=float)
+                    tare_accum[s_idx] += predict(s_idx, ch_data)
+                tare_count += 1
+            except Exception as e:
+                print(f"Tare sample error: {e}")
+        if tare_count == 0:
+            return None
+        return [tare_accum[i] / tare_count for i in range(n_sensors)]
+
+    # pos_buffer[sensor_idx][axis_idx] = list of floats
     pos_buffer  = [[[] for _ in range(N_POS)] for _ in range(n_sensors)]
     time_buffer = [[] for _ in range(n_sensors)]
     lock         = threading.Lock()
+    serial_lock  = threading.Lock()
     stop_event   = threading.Event()
+    running_event = threading.Event()
+    tare_event    = threading.Event()
     save_q       = queue.Queue()
     sample_times = collections.deque(maxlen=FREQ_WINDOW)
     freq_ref     = [0.0]
     time_ref     = [None]
     elapsed_ref  = [0.0]
     last_store   = [0.0]
+    status_ref   = ["Connected. Press Start to begin."]
+    tare_offset  = [np.zeros(N_POS) for _ in range(n_sensors)]
 
     # ── Tare ───────────────────────────────────────────────────────────────────
-    print(f"Taring sensors ({TARE_SAMPLES} samples)...")
-    tare_accum = [np.zeros(N_POS) for _ in range(n_sensors)]
-    tare_count = 0
-    while tare_count < TARE_SAMPLES:
-        try:
-            _, sensors_raw = sensor.process_single_measurement_all()
+    def reset_buffers():
+        with lock:
             for s_idx in range(n_sensors):
-                ch_data = np.array(sensors_raw[s_idx]["inductance"], dtype=float)
-                tare_accum[s_idx] += predict(s_idx, ch_data)
-            tare_count += 1
-        except Exception as e:
-            print(f"Tare sample error: {e}")
-    tare_offset = [tare_accum[i] / TARE_SAMPLES for i in range(n_sensors)]
-    print(f"Tare complete. Offsets: { {sensor_setup[i]['label']: np.round(tare_offset[i], 4).tolist() for i in range(n_sensors)} }")
+                time_buffer[s_idx].clear()
+                for ax in range(N_POS):
+                    pos_buffer[s_idx][ax].clear()
+            sample_times.clear()
+            freq_ref[0] = 0.0
+            time_ref[0] = None
+            elapsed_ref[0] = 0.0
+            last_store[0] = 0.0
+
+    def set_status(message):
+        with lock:
+            status_ref[0] = message
+
+    print(f"Taring sensors ({TARE_SAMPLES} samples)...")
+    initial_tare = compute_tare()
+    if initial_tare is not None:
+        tare_offset[:] = initial_tare
+    tare_summary = {
+        sensor_setup[i]["label"]: np.round(tare_offset[i], 4).tolist()
+        for i in range(n_sensors)
+    }
+    print(f"Tare complete. Offsets: {tare_summary}")
 
     # ── Acquisition thread ─────────────────────────────────────────────────────
     def acquisition_loop():
         while not stop_event.is_set():
+            if not running_event.is_set() or tare_event.is_set():
+                time.sleep(0.02)
+                continue
             try:
-                mcu_ts, sensors_raw = sensor.process_single_measurement_all()
+                with serial_lock:
+                    mcu_ts, sensors_raw = sensor.process_single_measurement_all()
                 positions = []
                 for s_idx in range(n_sensors):
                     ch_data = np.array(sensors_raw[s_idx]["inductance"], dtype=float)
@@ -236,7 +275,7 @@ def run_datalogger(port=PORT, sensor_setup=SENSOR_SETUP, model_dir=MODEL_DIR,
                             for ax in range(N_POS):
                                 pos_buffer[s_idx][ax].append(float(pos[ax]))
 
-                if save and store:
+                if save and store and running_event.is_set():
                     wall_t = time.time()
                     # Build one row: wall_time, elapsed_s, then for each sensor: L0..L3, dX, dY, dZ
                     parts = [f"{wall_t:.6f}", f"{elapsed_s:.6f}"]
@@ -288,10 +327,71 @@ def run_datalogger(port=PORT, sensor_setup=SENSOR_SETUP, model_dir=MODEL_DIR,
         )
         win.show()
 
+        controls = QtWidgets.QWidget()
+        controls_layout = QtWidgets.QHBoxLayout(controls)
+        controls_layout.setContentsMargins(6, 4, 6, 4)
+        start_btn = QtWidgets.QPushButton("Start")
+        stop_btn = QtWidgets.QPushButton("Stop")
+        retare_btn = QtWidgets.QPushButton("Retare")
+        clear_btn = QtWidgets.QPushButton("Clear Plot")
+        for btn in (start_btn, stop_btn, retare_btn, clear_btn):
+            controls_layout.addWidget(btn)
+        controls_layout.addStretch(1)
+
+        controls_proxy = QtWidgets.QGraphicsProxyWidget()
+        controls_proxy.setWidget(controls)
+        win.addItem(controls_proxy, row=0, col=0)
+
+        def start_test():
+            reset_buffers()
+            running_event.set()
+            set_status("Running.")
+
+        def stop_test():
+            running_event.clear()
+            set_status("Stopped.")
+
+        def clear_plot():
+            reset_buffers()
+            set_status("Plot cleared." if not running_event.is_set() else "Running. Plot cleared.")
+
+        def retare_worker():
+            was_running = running_event.is_set()
+            running_event.clear()
+            tare_event.set()
+            set_status("Retaring...")
+            new_tare = compute_tare()
+            if new_tare is not None:
+                tare_offset[:] = new_tare
+                summary = {
+                    sensor_setup[i]["label"]: np.round(tare_offset[i], 4).tolist()
+                    for i in range(n_sensors)
+                }
+                print(f"Retare complete. Offsets: {summary}")
+                set_status("Retare complete.")
+            else:
+                set_status("Retare failed.")
+            tare_event.clear()
+            if was_running and not stop_event.is_set():
+                reset_buffers()
+                running_event.set()
+                set_status("Running.")
+
+        def retare():
+            if tare_event.is_set():
+                return
+            threading.Thread(target=retare_worker, daemon=True).start()
+
+        start_btn.clicked.connect(start_test)
+        stop_btn.clicked.connect(stop_test)
+        clear_btn.clicked.connect(clear_plot)
+        retare_btn.clicked.connect(retare)
+        stop_btn.setEnabled(False)
+
         plot_items = []
         axis_lines = []
         for s_idx, cfg in enumerate(sensor_setup):
-            p = win.addPlot(row=s_idx, col=0,
+            p = win.addPlot(row=s_idx + 1, col=0,
                             title=f"{cfg['label']}  |  I2C{cfg['bus']} / 0x{cfg['addr']:02X}")
             p.setLabel("bottom", "Time", units="s")
             p.setLabel("left", "Position", units="mm")
@@ -303,21 +403,32 @@ def run_datalogger(port=PORT, sensor_setup=SENSOR_SETUP, model_dir=MODEL_DIR,
             plot_items.append(p)
 
         status_label = pg.LabelItem(justify="center")
-        win.addItem(status_label, row=n_sensors, col=0)
+        win.addItem(status_label, row=n_sensors + 1, col=0)
 
         def update():
             with lock:
                 freq  = freq_ref[0]
                 t_now = elapsed_ref[0]
+                status = status_ref[0]
                 t_snap   = [time_buffer[i][:] for i in range(n_sensors)]
                 pos_snap = [[pos_buffer[i][ax][:] for ax in range(N_POS)]
                             for i in range(n_sensors)]
+
+            is_running = running_event.is_set()
+            is_taring = tare_event.is_set()
+            start_btn.setEnabled(not is_running and not is_taring)
+            stop_btn.setEnabled(is_running and not is_taring)
+            retare_btn.setEnabled(not is_taring)
+            clear_btn.setEnabled(not is_taring)
 
             for s_idx, lines in enumerate(axis_lines):
                 p = plot_items[s_idx]
                 t_buf = t_snap[s_idx]
                 n = len(t_buf)
                 if n == 0:
+                    for line in lines:
+                        line.setData([], [])
+                    p.setXRange(0, test_time, padding=0)
                     continue
                 t_arr = np.array(t_buf)
                 if n > MAX_PLOT_POINTS:
@@ -342,7 +453,8 @@ def run_datalogger(port=PORT, sensor_setup=SENSOR_SETUP, model_dir=MODEL_DIR,
 
             status_label.setText(
                 f"<span style='font-size:11pt'>"
-                f"t = {t_now:.3f} s &nbsp;|&nbsp; Sample rate: {freq:.1f} Hz</span>"
+                f"{status} &nbsp;|&nbsp; t = {t_now:.3f} s "
+                f"&nbsp;|&nbsp; Sample rate: {freq:.1f} Hz</span>"
             )
 
         timer = QtCore.QTimer()
@@ -363,6 +475,9 @@ def run_datalogger(port=PORT, sensor_setup=SENSOR_SETUP, model_dir=MODEL_DIR,
 
     else:
         print("Recording (no plot). Press Ctrl+C to stop.")
+        reset_buffers()
+        running_event.set()
+        set_status("Running.")
         try:
             while not stop_event.is_set():
                 time.sleep(0.1)
