@@ -21,9 +21,9 @@ MODEL_DIR = os.path.join(_HERE, "../v2_sensor/models")
 #   "addr"  : I2C address (e.g. 0x2A)
 #   "label" : human-readable sensor ID (e.g. "S2") — also used to find model files
 SENSOR_SETUP = [
-    {"bus": 0, "addr": 0x2A, "label": "s2"},
-    {"bus": 1, "addr": 0x2A, "label": "s3"},
-    {"bus": 1, "addr": 0x2B, "label": "s4"},
+    {"bus": 0, "addr": 0x2A, "label": "s4"},
+    {"bus": 1, "addr": 0x2A, "label": "s2"},
+    {"bus": 1, "addr": 0x2B, "label": "s3"},
 ]
 
 PORT              = "COM3"
@@ -36,6 +36,58 @@ POS_LABELS        = ["dX", "dY", "dZ"]
 N_POS             = 3
 N_CHANNELS        = 4
 TARE_SAMPLES      = 10   # number of samples averaged for tare
+
+
+def calibration_features(inductance, feature_set):
+    values = np.asarray(inductance, dtype=np.float32).reshape(1, -1)
+    if feature_set == "raw":
+        return values
+    if feature_set != "physical":
+        raise ValueError(f"Unsupported calibration feature set: {feature_set}")
+
+    L0, L1, L2, L3 = values.T
+    total = L0 + L1 + L2 + L3
+    mean = total / 4.0
+    x_balance = (L1 + L2) - (L0 + L3)
+    y_balance = (L2 + L3) - (L0 + L1)
+
+    return np.column_stack(
+        [
+            values,
+            total,
+            mean,
+            L0 + L1,
+            L1 + L2,
+            L2 + L3,
+            L3 + L0,
+            x_balance,
+            y_balance,
+            L0 - L2,
+            L1 - L3,
+        ]
+    ).astype(np.float32)
+
+
+def build_calibration_model(input_size, output_size, hidden_sizes, activation):
+    import torch.nn as nn
+
+    class CalibrationNet(nn.Module):
+        def __init__(self):
+            super().__init__()
+            act_fn = {"relu": nn.ReLU, "tanh": nn.Tanh, "elu": nn.ELU}[activation]
+            layers = []
+            prev = input_size
+            for hidden in hidden_sizes:
+                layers.append(nn.Linear(prev, hidden))
+                layers.append(act_fn())
+                prev = hidden
+            layers.append(nn.Linear(prev, output_size))
+            self.net = nn.Sequential(*layers)
+
+        def forward(self, x):
+            return self.net(x)
+
+    return CalibrationNet()
 
 
 def run_datalogger(port=PORT, sensor_setup=SENSOR_SETUP, model_dir=MODEL_DIR,
@@ -54,22 +106,41 @@ def run_datalogger(port=PORT, sensor_setup=SENSOR_SETUP, model_dir=MODEL_DIR,
     import traceback
     import pickle
     import os
-    from sensor_read import FeedForwardNN
     calib_models = []
     calib_scalers = []   # list of {"scaler_X": ..., "scaler_y": ...} or None
     for s in sensor_setup:
         abs_path    = os.path.abspath(os.path.join(model_dir, f"{s['label'].lower()}.pth"))
         scaler_path = os.path.abspath(os.path.join(model_dir, f"{s['label'].lower()}_scalers.pkl"))
         print(f"[CALIB] Loading {s['label']} from: {abs_path}  (exists={os.path.exists(abs_path)})")
+
+        if os.path.exists(scaler_path):
+            with open(scaler_path, "rb") as f:
+                scalers = pickle.load(f)
+            print(f"[CALIB] Scalers loaded for {s['label']}")
+        else:
+            print(f"WARNING: no scalers found at {scaler_path} - predictions will be unscaled!")
+            scalers = None
+
         try:
             state_dict = torch.load(abs_path, map_location="cpu")
             # Infer hidden layer sizes from checkpoint weights (exclude output layer)
             weight_keys = [k for k in state_dict.keys() if k.endswith(".weight")]
+            input_size = state_dict[weight_keys[0]].shape[1]
             hidden_sizes = [state_dict[k].shape[0] for k in weight_keys[:-1]]
-            model = FeedForwardNN(input_size=N_CHANNELS, output_size=N_POS, hidden_sizes=hidden_sizes)
+            activation = scalers.get("activation", "relu") if scalers is not None else "relu"
+            feature_set = scalers.get("feature_set", "raw") if scalers is not None else "raw"
+            model = build_calibration_model(
+                input_size=input_size,
+                output_size=N_POS,
+                hidden_sizes=hidden_sizes,
+                activation=activation,
+            )
             model.load_state_dict(state_dict)
             model.eval()
-            print(f"[CALIB] Loaded OK: {s['label']}")
+            print(
+                f"[CALIB] Loaded OK: {s['label']} "
+                f"(features={feature_set}, activation={activation}, hidden={hidden_sizes})"
+            )
         except Exception as e:
             print(f"WARNING: could not load calibration for {s['label']}: {e}")
             traceback.print_exc()
@@ -94,11 +165,13 @@ def run_datalogger(port=PORT, sensor_setup=SENSOR_SETUP, model_dir=MODEL_DIR,
             return np.zeros(N_POS)
         if np.all(inductance == 0):
             print(f"[PREDICT] {label}: WARNING all inductance values are zero!")
+        feature_set = scalers.get("feature_set", "raw") if scalers is not None else "raw"
+        features = calibration_features(inductance, feature_set)
         # Scale input
         if scalers is not None:
-            x = scalers["scaler_X"].transform(inductance.reshape(1, -1)).astype(np.float32)
+            x = scalers["scaler_X"].transform(features).astype(np.float32)
         else:
-            x = inductance.reshape(1, -1).astype(np.float32)
+            x = features.astype(np.float32)
         t = torch.tensor(x, dtype=torch.float32)
         with torch.no_grad():
             y_scaled = model(t).numpy()
